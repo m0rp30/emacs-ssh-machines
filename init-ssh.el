@@ -10,6 +10,14 @@
   :group 'tools
   :prefix "ssh-")
 
+(cl-defstruct ssh-machine
+  "Structure of machine"
+  name
+  host
+  user
+  description
+  key)
+
 (define-multisession-variable ssh-machines-list '()
   "A list of SSH machines to connect to.
 Each element is a list (NAME ADDRESS DESCRIPTION [KEY-FILE]).
@@ -29,12 +37,24 @@ Possible values are `scp' or `rsync'."
   :type '(choice (const scp) (const rsync))
   :group 'ssh-machines)
 
-(defun add-ssh-machine (name address notes)
-  "Add a new SSH machine to the list in the format of (NAME, ADDRESS, NOTES)."
-  (interactive "sName: \nsAddress: \nsNotes: ")
-  (setf (multisession-value ssh-machines-list)
-	(append (multisession-value ssh-machines-list) (list (list name address notes))))
-  (message "Added %s to SSH machines list" name))
+(defun add-ssh-machine ()
+  "Add a new SSH machine."
+  (interactive)
+  (let* ((name (read-string "Name: "))
+         (host (read-string "Host: "))
+         (user (read-string "User (optional): "))
+         (desc (read-string "Description: "))
+         (key (read-string "Key (optional): "))
+         (machine (make-ssh-machine
+                   :name name
+                   :host host
+                   :user user
+                   :description desc
+                   :key (unless (string-empty-p key) key))))
+    (setf (multisession-value ssh-machines-list)
+          (append (multisession-value ssh-machines-list)
+                  (list machine)))
+    (message "Added %s" name)))
 
 (defun remove-ssh-machine ()
   "Remove an SSH machine from the list by selecting from a prompted list."
@@ -51,21 +71,37 @@ Possible values are `scp' or `rsync'."
 	(setf (multisession-value ssh-machines-list) filtered-list)
 	(message "Removed %s from SSH machines list" selected-name)))))
 
+(defun ssh-machine-address (machine)
+  "Return full SSH address for MACHINE."
+  (let ((user (ssh-machine-user machine))
+        (host (ssh-machine-host machine)))
+    (if (and user (not (string-empty-p user)))
+        (format "%s@%s" user host)
+      host)))
+
 (defun ssh-connect ()
-  "Connect to a machine via SSH, using associated key if available."
+  "Connect to a machine via SSH."
   (interactive)
   (unless (multisession-value ssh-machines-list)
     (user-error "No SSH machines configured"))
-  (let* ((machine-names (mapcar #'car (multisession-value ssh-machines-list)))
-	 (selected-name (completing-read "Select machine: " machine-names))
-	 (machine-info (assoc selected-name (multisession-value ssh-machines-list))))
-    (when machine-info
-      (pcase-let ((`(,_ ,address ,_ . ,rest) machine-info))
-	(let ((key-option (if (car rest)
-			      (format " -i %s" (shell-quote-argument
-						(expand-file-name (car rest) ssh-keys-directory)))
-			    "")))
-	  (ansi-term (concat "ssh" key-option " " address)))))))
+
+  (let* ((machines (multisession-value ssh-machines-list))
+         (names (mapcar #'ssh-machine-name machines))
+         (selected (completing-read "Select machine: " names))
+         (machine (cl-find selected machines
+                           :key #'ssh-machine-name
+                           :test #'string=)))
+
+    (when machine
+      (let* ((address (ssh-machine-address machine))
+             (key (ssh-machine-key machine))
+             (key-option
+              (when key
+                (format " -i %s"
+                        (shell-quote-argument
+                         (expand-file-name key ssh-keys-directory))))))
+
+        (ansi-term (concat "ssh" key-option " " address))))))
 
 (defvar ssh-machines-mode-map
   (let ((map (make-sparse-keymap)))
@@ -85,21 +121,26 @@ Possible values are `scp' or `rsync'."
 \\{ssh-machines-mode-map}"
   :keymap ssh-machines-mode-map
   (setq tabulated-list-format [("Name" 15 t)
-                               ("Address" 30 t)
-                               ("Description" 25 t)
-                               ("Key" 15 t)])
+			       ("Host" 25 t)
+			       ("User" 12 t)
+			       ("Description" 25 t)
+			       ("Key" 15 t)])
   (setq tabulated-list-padding 2)
   (tabulated-list-init-header))
 
 (defun ssh-machines--get-entries ()
   "Return entries for `tabulated-list-entries'."
-  (mapcar (lambda (machine)
-            (pcase-let ((`(,name ,address ,desc . ,rest) machine))
-              (list name (vector name
-                                 address
-                                 (or desc "")
-                                 (or (car rest) "")))))
-          (multisession-value ssh-machines-list)))
+  (mapcar
+   (lambda (machine)
+     (list
+      (ssh-machine-name machine)
+      (vector
+       (ssh-machine-name machine)
+       (ssh-machine-host machine)
+       (or (ssh-machine-user machine) "")
+       (or (ssh-machine-description machine) "")
+       (or (ssh-machine-key machine) ""))))
+   (multisession-value ssh-machines-list)))
 
 (defun ssh-machines-connect-at-point ()
   "Connect to the SSH machine at point."
@@ -404,6 +445,30 @@ Use \='ssh-copy-id\=' internally."
 				   current-list)))
 	(setf (multisession-value ssh-machines-list) updated-list)
 	(message "Associated %s with machine %s" selected-key selected-name)))))
+
+(defun ssh-machines-migrate-data ()
+  "Convert old list format to ssh-machine structs."
+  (interactive)
+  (let ((new-list
+         (mapcar
+          (lambda (entry)
+            (if (ssh-machine-p entry)
+                entry
+              (pcase-let ((`(,name ,address ,desc . ,rest) entry))
+                (let* ((parts (split-string address "@"))
+                       (user (when (= (length parts) 2) (car parts)))
+                       (host (if (= (length parts) 2)
+                                 (cadr parts)
+                               address))
+                       (key (car rest)))
+                  (make-ssh-machine
+                   :name name
+                   :host host
+                   :user user
+                   :description desc
+                   :key key)))))
+          (multisession-value ssh-machines-list))))
+    (setf (multisession-value ssh-machines-list) new-list)))
 
 (provide 'init-ssh)
 
