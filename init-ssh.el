@@ -20,7 +20,7 @@
 
 (define-multisession-variable ssh-machines-list '()
   "A list of SSH machines to connect to.
-Each element is a list (NAME ADDRESS DESCRIPTION [KEY-FILE]).
+Each element is an `ssh-machine` struct.
 NAME is the name of the machine.
 ADDRESS is the SSH address of the machine.
 DESCRIPTION is a short description of the machine.
@@ -38,38 +38,67 @@ Possible values are `scp' or `rsync'."
   :group 'ssh-machines)
 
 (defun add-ssh-machine ()
-  "Add a new SSH machine."
+  "Add a new SSH machine, ensuring unique name and host."
   (interactive)
-  (let* ((name (read-string "Name: "))
-         (host (read-string "Host: "))
-         (user (read-string "User (optional): "))
-         (desc (read-string "Description: "))
-         (key (read-string "Key (optional): "))
-         (machine (make-ssh-machine
-                   :name name
-                   :host host
-                   :user user
-                   :description desc
-                   :key (unless (string-empty-p key) key))))
-    (setf (multisession-value ssh-machines-list)
-          (append (multisession-value ssh-machines-list)
-                  (list machine)))
-    (message "Added %s" name)))
+  (let* ((machines (multisession-value ssh-machines-list))
+         (name (read-string "Name: ")))
+
+    ;; Check for duplicate name
+    (when (cl-find name machines :key #'ssh-machine-name :test #'string=)
+      (user-error "A machine with name '%s' already exists" name))
+
+    (let ((host (read-string "Host: ")))
+      ;; Check for duplicate host
+      (when (cl-find host machines :key #'ssh-machine-host :test #'string=)
+        (user-error "A machine with host '%s' already exists" host))
+
+      (let* ((user (read-string "User (optional): "))
+             (desc (read-string "Description: "))
+             (key (ssh-select-or-create-key))
+             (machine (make-ssh-machine
+                       :name name
+                       :host host
+                       :user (unless (string-empty-p user) user)
+                       :description desc
+                       :key key)))
+        (push machine (multisession-value ssh-machines-list))
+        (message "Machine %s created" name)))))
+
+;; (defun add-ssh-machine ()
+;;   "Add a new SSH machine."
+;;   (interactive)
+
+;;   (let* ((name (read-string "Name: "))
+;;          (host (read-string "Host: "))
+;;          (user (read-string "User (optional): "))
+;;          (desc (read-string "Description: "))
+;;          (key (ssh-select-or-create-key))
+
+;;          (machine
+;;           (make-ssh-machine
+;;            :name name
+;;            :host host
+;;            :user (unless (string-empty-p user) user)
+;;            :description desc
+;;            :key key)))
+
+;;     (push machine (multisession-value ssh-machines-list))
+
+;;     (message "Machine %s created" name)))
 
 (defun remove-ssh-machine ()
-  "Remove an SSH machine from the list by selecting from a prompted list."
   (interactive)
-  (unless (multisession-value ssh-machines-list)
-    (user-error "No SSH machines configured"))
-  (let* ((machine-names (mapcar (lambda (machine) (car machine)) (multisession-value ssh-machines-list)))
-	 (selected-name (completing-read "Select SSH machine to remove: " machine-names)))
-    (when selected-name
-      (let* ((current-list (multisession-value ssh-machines-list))
-	     (filtered-list (cl-remove-if (lambda (machine)
-					    (string= selected-name (car machine)))
-					  current-list)))
-	(setf (multisession-value ssh-machines-list) filtered-list)
-	(message "Removed %s from SSH machines list" selected-name)))))
+  (let* ((machines (multisession-value ssh-machines-list))
+         (selected
+          (completing-read
+           "Select SSH machine to remove: "
+           (mapcar #'ssh-machine-name machines) nil t)))
+    (setf (multisession-value ssh-machines-list)
+          (cl-remove-if
+           (lambda (m)
+             (string= selected (ssh-machine-name m)))
+           machines))
+    (message "Removed %s from SSH machines list" selected)))
 
 (defun ssh-machine-address (machine)
   "Return full SSH address for MACHINE."
@@ -78,6 +107,16 @@ Possible values are `scp' or `rsync'."
     (if (and user (not (string-empty-p user)))
         (format "%s@%s" user host)
       host)))
+
+(defun ssh-connect-machine (machine)
+  (let* ((address (ssh-machine-address machine))
+         (key (ssh-machine-key machine))
+         (key-option
+          (when key
+            (format " -i %s"
+                    (shell-quote-argument
+                     (expand-file-name key ssh-keys-directory))))))
+    (ansi-term (concat "ssh" key-option " " address))))
 
 (defun ssh-connect ()
   "Connect to a machine via SSH."
@@ -93,15 +132,16 @@ Possible values are `scp' or `rsync'."
                            :test #'string=)))
 
     (when machine
-      (let* ((address (ssh-machine-address machine))
-             (key (ssh-machine-key machine))
-             (key-option
-              (when key
-                (format " -i %s"
-                        (shell-quote-argument
-                         (expand-file-name key ssh-keys-directory))))))
+      (ssh-connect-machine machine))))
 
-        (ansi-term (concat "ssh" key-option " " address))))))
+(defun ssh-machines-connect-at-point ()
+  "Connect to the SSH machine at point."
+  (interactive)
+  (let ((name (tabulated-list-get-id)))
+    (when name
+      (let ((machine (ssh-find-machine name)))
+        (when machine
+          (ssh-connect-machine machine))))))
 
 (defvar ssh-machines-mode-map
   (let ((map (make-sparse-keymap)))
@@ -122,7 +162,6 @@ Possible values are `scp' or `rsync'."
   :keymap ssh-machines-mode-map
   (setq tabulated-list-format [("Name" 15 t)
 			       ("Host" 25 t)
-			       ("User" 12 t)
 			       ("Description" 25 t)
 			       ("Key" 15 t)])
   (setq tabulated-list-padding 2)
@@ -130,92 +169,93 @@ Possible values are `scp' or `rsync'."
 
 (defun ssh-machines--get-entries ()
   "Return entries for `tabulated-list-entries'."
-  (mapcar
-   (lambda (machine)
-     (list
-      (ssh-machine-name machine)
-      (vector
-       (ssh-machine-name machine)
-       (ssh-machine-host machine)
-       (or (ssh-machine-user machine) "")
-       (or (ssh-machine-description machine) "")
-       (or (ssh-machine-key machine) ""))))
-   (multisession-value ssh-machines-list)))
-
-(defun ssh-machines-connect-at-point ()
-  "Connect to the SSH machine at point."
-  (interactive)
-  (let ((name (tabulated-list-get-id)))
-    (when name
-      (let ((machine-info (assoc name (multisession-value ssh-machines-list))))
-        (when machine-info
-          (pcase-let ((`(,_ ,address ,_ . ,rest) machine-info))
-            (let ((key-option (if (car rest)
-                                  (format " -i %s" (shell-quote-argument
-                                                    (expand-file-name (car rest) ssh-keys-directory)))
-                                "")))
-              (ansi-term (concat "ssh" key-option " " address)))))))))
+  (let ((machines (multisession-value ssh-machines-list)))
+    (mapcar
+     (lambda (machine)
+       (list
+        (ssh-machine-name machine)
+        (vector
+         (ssh-machine-name machine)
+	 (ssh-machine-address machine)
+         ;;(ssh-machine-host machine)
+         ;;(or (ssh-machine-user machine) "")
+         (or (ssh-machine-description machine) "")
+         (or (ssh-machine-key machine) ""))))
+     machines)))
 
 (defun ssh-machines-delete-at-point ()
   "Delete the SSH machine at point."
   (interactive)
   (let ((name (tabulated-list-get-id)))
     (when (and name (yes-or-no-p (format "Delete machine '%s'? " name)))
-      (let ((filtered-list (cl-remove-if (lambda (machine)
-                                           (string= name (car machine)))
-                                         (multisession-value ssh-machines-list))))
+      (let ((filtered-list
+             (cl-remove-if (lambda (m)
+                             (string= name (ssh-machine-name m)))
+                           (multisession-value ssh-machines-list))))
         (setf (multisession-value ssh-machines-list) filtered-list)
         (message "Deleted %s" name)
         (list-ssh-machines)))))
 
 (defun ssh-machines-edit-at-point ()
-  "Edit the SSH machine at point."
+  "Edit the SSH machine at point using `ssh-machine` struct."
   (interactive)
   (let ((name (tabulated-list-get-id)))
-    (when name
-      (let ((machine-info (assoc name (multisession-value ssh-machines-list))))
-        (when machine-info
-          (pcase-let ((`(,old-name ,old-address ,old-desc . ,rest) machine-info))
-            (let* ((new-name (read-string "Name: " old-name))
-                   (new-address (read-string "Address: " old-address))
-                   (new-desc (read-string "Description: " old-desc))
-                   (key-file (car rest))
-                   (updated-machine (if key-file
-                                        (list new-name new-address new-desc key-file)
-                                      (list new-name new-address new-desc)))
-                   (updated-list (mapcar (lambda (m)
-                                           (if (string= (car m) old-name)
-                                               updated-machine
-                                             m))
-                                         (multisession-value ssh-machines-list))))
-              (setf (multisession-value ssh-machines-list) updated-list)
-              (message "Updated %s" new-name)
-              (list-ssh-machines))))))))
+    (if (not name)
+        (user-error "No machine at point")
+      (let ((machine (ssh-find-machine name)))
+        (if (not machine)
+            (user-error "Machine '%s' not found" name)
+          ;; Prompt for new values, defaulting to current values
+          (let* ((new-name (read-string "Name: " (ssh-machine-name machine)))
+                 (new-host (read-string "Host: " (ssh-machine-host machine)))
+                 (new-user (read-string "User (optional): " (or (ssh-machine-user machine) "")))
+                 (new-desc (read-string "Description: " (or (ssh-machine-description machine) "")))
+                 ;; Use ssh-select-or-create-key for key selection
+                 (new-key (ssh-select-or-create-key)))
+
+            ;; Update struct fields
+            (setf (ssh-machine-name machine) new-name
+                  (ssh-machine-host machine) new-host
+                  (ssh-machine-user machine) (unless (string-empty-p new-user) new-user)
+                  (ssh-machine-description machine) new-desc
+                  (ssh-machine-key machine) new-key)
+
+            (message "Updated machine '%s'" new-name)
+            ;; Refresh the tabulated list buffer
+            (when (derived-mode-p 'ssh-machines-mode)
+              (tabulated-list-revert))))))))
 
 (defun edit-ssh-machine ()
   "Edit an SSH machine by selecting from the list."
   (interactive)
   (unless (multisession-value ssh-machines-list)
     (user-error "No SSH machines configured"))
-  (let* ((machine-names (mapcar #'car (multisession-value ssh-machines-list)))
+
+  (let* ((machines (multisession-value ssh-machines-list))
+         (machine-names (mapcar #'ssh-machine-name machines))
          (selected-name (completing-read "Select machine to edit: " machine-names nil t))
-         (machine-info (assoc selected-name (multisession-value ssh-machines-list))))
-    (when machine-info
-      (pcase-let ((`(,old-name ,old-address ,old-desc . ,rest) machine-info))
-        (let* ((new-name (read-string "Name: " old-name))
-               (new-address (read-string "Address: " old-address))
-               (new-desc (read-string "Description: " old-desc))
-               (key-file (car rest))
-               (updated-machine (if key-file
-                                    (list new-name new-address new-desc key-file)
-                                  (list new-name new-address new-desc)))
-               (updated-list (mapcar (lambda (m)
-                                       (if (string= (car m) old-name)
-                                           updated-machine
-                                         m))
-                                     (multisession-value ssh-machines-list))))
-          (setf (multisession-value ssh-machines-list) updated-list)
-          (message "Updated %s" new-name))))))
+         (machine (ssh-find-machine selected-name)))
+
+    (when machine
+      (let* ((new-name (read-string "Name: " (ssh-machine-name machine)))
+             (new-host (read-string "Host: " (ssh-machine-host machine)))
+             (new-user (read-string "User: " (or (ssh-machine-user machine) "")))
+             (new-desc (read-string "Description: " (ssh-machine-description machine)))
+             (new-key (read-string "Key (optional): " (or (ssh-machine-key machine) ""))))
+
+        (setf (ssh-machine-name machine) new-name
+              (ssh-machine-host machine) new-host
+              (ssh-machine-user machine) (unless (string-empty-p new-user) new-user)
+              (ssh-machine-description machine) new-desc
+              (ssh-machine-key machine) (unless (string-empty-p new-key) new-key))
+
+        (message "Updated %s" new-name)))))
+
+(defun ssh-find-machine (name)
+  (cl-find name
+           (multisession-value ssh-machines-list)
+           :key #'ssh-machine-name
+           :test #'string=))
 
 (defun list-ssh-machines ()
   "List all SSH machines in an interactive buffer."
@@ -290,20 +330,33 @@ Skips wildcard patterns like Host * or Host *.example.com."
     (nreverse hosts)))
 
 (defun import-from-ssh-config ()
-  "Import SSH hosts from ~/.ssh/config into the machines list.
-Skips wildcard patterns and duplicates (hosts already in the list)."
+  "Import SSH hosts from ~/.ssh/config into `ssh-machines-list`.
+Skips wildcard patterns and duplicates. Converts entries to `ssh-machine` structs."
   (interactive)
   (let* ((config-file "~/.ssh/config")
          (parsed-hosts (ssh-parse-config-file config-file))
-         (existing-names (mapcar #'car (multisession-value ssh-machines-list)))
+         (existing-names (mapcar #'ssh-machine-name (multisession-value ssh-machines-list)))
          (imported 0)
          (duplicates 0))
     (dolist (host parsed-hosts)
-      (if (member (car host) existing-names)
-          (cl-incf duplicates)
-        (setf (multisession-value ssh-machines-list)
-              (append (multisession-value ssh-machines-list) (list host)))
-        (cl-incf imported)))
+      (let* ((name (nth 0 host))
+             (address (nth 1 host))
+             (desc (nth 2 host))
+             (key (nth 3 host)))
+        (if (member name existing-names)
+            (cl-incf duplicates)
+          ;; Split user@host if needed
+          (let* ((parts (split-string address "@"))
+                 (user (when (= (length parts) 2) (car parts)))
+                 (host-name (if (= (length parts) 2) (cadr parts) address))
+                 (machine (make-ssh-machine
+                           :name name
+                           :host host-name
+                           :user user
+                           :description desc
+                           :key key)))
+            (push machine (multisession-value ssh-machines-list)))
+          (cl-incf imported))))
     (message "Imported %d host%s from %s%s"
              imported
              (if (= imported 1) "" "s")
@@ -315,31 +368,53 @@ Skips wildcard patterns and duplicates (hosts already in the list)."
                ""))))
 
 (defun copy-file-to-ssh-machine (file-path)
-  "Copy a file (FILE-PATH) from the host machine to a selected remote SSH machine.
-The user will be prompted to select the target machine and specify the remote
-destination path."
+  "Copy FILE-PATH to a selected SSH machine interactively via SCP.
+Prompts for remote path. Opens a terminal for secure password entry."
   (interactive "fFile to copy: ")
   (unless (multisession-value ssh-machines-list)
     (user-error "No SSH machines configured"))
-  (let* ((machine-names (mapcar #'car (multisession-value ssh-machines-list)))
-	 (selected-name (completing-read "Select target machine: " machine-names))
-	 (machine-info (assoc selected-name (multisession-value ssh-machines-list))))
-    (when machine-info
-      (pcase-let ((`(,_ ,address ,_) machine-info))
-	(let ((remote-path (read-string "Remote destination path: ")))
-	  (cl-case ssh-copy-method
-	    (scp
-	     (shell-command (format "scp %s %s:%s"
-				    (shell-quote-argument file-path)
-				    address
-				    (shell-quote-argument remote-path)))
-	     (message "File %s copied to %s:%s" file-path address remote-path))
-	    (rsync
-	     (shell-command (format "rsync %s %s:%s"
-				    (shell-quote-argument file-path)
-				    address
-				    (shell-quote-argument remote-path)))
-	     (message "File %s copied to %s:%s via rsync" file-path address remote-path))))))))
+
+  (let* ((machines (multisession-value ssh-machines-list))
+         (selected-name (completing-read "Select target machine: "
+                                         (mapcar #'ssh-machine-name machines) nil t))
+         (machine (cl-find selected-name machines
+                           :key #'ssh-machine-name :test #'string=)))
+    (when machine
+      (let* ((remote-path (read-string "Remote destination path: "))
+             (local-file (expand-file-name file-path))
+             (address (ssh-machine-address machine))
+             (key (ssh-machine-key machine))
+             (key-option (if key
+                             (format "-i %s" (shell-quote-argument
+                                               (expand-file-name key ssh-keys-directory)))
+                           ""))
+             (cmd (format "scp %s %s %s; echo \"Transfer complete, press Enter to close.\"; read"
+                          key-option
+                          (shell-quote-argument local-file)
+                          (concat address ":" (shell-quote-argument remote-path)))))
+        ;; Use term-mode to allow interactive password entry
+        (let ((buf (generate-new-buffer "*SCP Transfer*")))
+          (with-current-buffer buf
+            (term-mode)
+            (term-exec buf "scp-transfer" "/bin/sh" nil (list "-c" cmd)))
+          (switch-to-buffer buf))))))
+
+(defun ssh-list-private-keys ()
+  "Return list of SSH private keys in `ssh-keys-directory`."
+  (cl-remove-if
+   (lambda (file) (string-match-p "\\.pub$" file))
+   (directory-files ssh-keys-directory nil "^id_.*$")))
+
+(defun ssh-select-or-create-key ()
+  "Select an existing SSH key or create a new one."
+  (let* ((keys (sort (ssh-list-private-keys) #'string<))
+         (choices (append '("[None]" "[Generate new key]") keys))
+         (selection (completing-read "SSH key: " choices nil nil nil nil)))
+    (cond ((string= selection "[Generate new key]")
+	   (call-interactively #'ssh-generate-key)
+	   (ssh-select-or-create-key))
+	  ((string= selection "[None]") nil)
+	  (t selection))))
 
 (defun ssh-list-keys ()
   "List all SSH keys in the SSH keys directory."
@@ -398,53 +473,51 @@ KEY-COMMENT is typically your email address for identification."
 	(async-shell-command command "*SSH Key Generation*")))))
 
 (defun ssh-copy-key (key-file)
-  "Copy an SSH public key (KEY-FILE) to a remote machine.
-Use \='ssh-copy-id\=' internally."
+  "Copy an SSH public key (KEY-FILE) to a selected SSH machine using `ssh-copy-id`.
+Prompts for both key and machine, uses `ssh-machine` structs."
   (interactive
    (list (completing-read "Select key to copy: "
-			  (cl-remove-if
-			   (lambda (file) (string-match-p "\\.pub$" file))
-			   (directory-files ssh-keys-directory nil "^id_.*$"))
-			  nil t)))
+                          (ssh-list-private-keys) nil t)))
   (unless (multisession-value ssh-machines-list)
     (user-error "No SSH machines configured"))
-  (let* ((machine-names (mapcar #'car (multisession-value ssh-machines-list)))
-	 (selected-name (completing-read "Select target machine: " machine-names))
-	 (machine-info (assoc selected-name (multisession-value ssh-machines-list))))
-    (when machine-info
-      (pcase-let ((`(,_ ,address ,_) machine-info))
-	(let ((key-path (expand-file-name (concat key-file ".pub") ssh-keys-directory)))
-	  (if (file-exists-p key-path)
-	      (async-shell-command
-	       (format "ssh-copy-id -i %s %s" (shell-quote-argument key-path) address)
-	       "*SSH Copy ID*")
-	    (user-error "Public key file %s does not exist" key-path)))))))
+
+  ;; Seleziona la macchina
+  (let* ((machines (multisession-value ssh-machines-list))
+         (selected-name (completing-read "Select target machine: "
+                                         (mapcar #'ssh-machine-name machines) nil t))
+         (machine (ssh-find-machine selected-name)))
+    (unless machine
+      (user-error "Machine '%s' not found" selected-name))
+
+    ;; Verifica che il file della chiave pubblica esista
+    (let ((pub-key-path (expand-file-name (concat key-file ".pub") ssh-keys-directory)))
+      (unless (file-exists-p pub-key-path)
+        (user-error "Public key file %s does not exist" pub-key-path))
+
+      ;; Costruisci il comando e lancia async
+      (async-shell-command
+       (format "ssh-copy-id -i %s %s"
+               (shell-quote-argument pub-key-path)
+               (ssh-machine-address machine))
+       "*SSH Copy ID*")
+      (message "Started copying key %s to %s..." key-file selected-name))))
 
 (defun ssh-associate-key-with-machine ()
-  "Associate an SSH key with a specific machine in the list."
+  "Associate an SSH key with a specific machine in `ssh-machines-list` using the `ssh-machine` struct."
   (interactive)
   (unless (multisession-value ssh-machines-list)
     (user-error "No SSH machines configured"))
-  (let* ((machine-names (mapcar #'car (multisession-value ssh-machines-list)))
-	 (selected-name (completing-read "Select machine: " machine-names))
-	 (machine-info (assoc selected-name (multisession-value ssh-machines-list)))
-	 (key-files (cl-remove-if
-		     (lambda (file) (string-match-p "\\.pub$" file))
-		     (directory-files ssh-keys-directory nil "^id_.*$")))
-	 (selected-key (completing-read "Select key to associate: " key-files)))
-    (when (and machine-info selected-key)
-      (let* ((current-list (multisession-value ssh-machines-list))
-	     (updated-machine (list (car machine-info)
-				    (cadr machine-info)
-				    (caddr machine-info)
-				    selected-key))
-	     (updated-list (mapcar (lambda (m)
-				     (if (string= (car m) selected-name)
-					 updated-machine
-				       m))
-				   current-list)))
-	(setf (multisession-value ssh-machines-list) updated-list)
-	(message "Associated %s with machine %s" selected-key selected-name)))))
+  (let* ((machines (multisession-value ssh-machines-list))
+         (selected-name (completing-read "Select machine: "
+                                         (mapcar #'ssh-machine-name machines) nil t))
+         (machine (ssh-find-machine selected-name)))
+    (unless machine
+      (user-error "Machine '%s' not found" selected-name))
+    (let ((selected-key (ssh-select-or-create-key)))
+      (setf (ssh-machine-key machine) selected-key)
+      (message "Associated key '%s' with machine '%s'" (or selected-key "[None]") selected-name)
+      (when (derived-mode-p 'ssh-machines-mode)
+        (tabulated-list-revert)))))
 
 (defun ssh-machines-migrate-data ()
   "Convert old list format to ssh-machine structs."
