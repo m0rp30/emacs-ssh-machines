@@ -11,7 +11,12 @@
   :prefix "ssh-")
 
 (cl-defstruct ssh-machine
-  "Structure of machine"
+  "A remote machine reachable via SSH.
+  NAME is a display label.
+  HOST is the hostname or IP.
+  USER is an optional login username.
+  DESCRIPTION is a free-form note.
+  KEY is an optional private key filename relative to `ssh-keys-directory'."
   name
   host
   user
@@ -21,10 +26,11 @@
 (define-multisession-variable ssh-machines-list '()
   "A list of SSH machines to connect to.
 Each element is an `ssh-machine` struct.
-NAME is the name of the machine.
-ADDRESS is the SSH address of the machine.
-DESCRIPTION is a short description of the machine.
-Optional KEY-FILE is the filename of an SSH key to use.")
+NAME is a display label.
+HOST is the hostname or IP.
+USER is an optional login username.
+DESCRIPTION is a free-form note.
+KEY is an optional private key filename relative to `ssh-keys-directory'.")
 
 (defcustom ssh-keys-directory "~/.ssh/"
   "Directory where SSH keys are stored."
@@ -38,53 +44,36 @@ Possible values are `scp' or `rsync'."
   :group 'ssh-machines)
 
 (defun add-ssh-machine ()
-  "Add a new SSH machine, ensuring unique name and host."
+  "Add a new SSH machine, ensuring unique name and host, and normalize optional fields."
   (interactive)
   (let* ((machines (multisession-value ssh-machines-list))
-         (name (read-string "Name: ")))
-
-    ;; Check for duplicate name
+         ;; Read and validate name
+         (name (string-trim (read-string "Name: "))))
+    (when (string-empty-p name)
+      (user-error "Machine name cannot be empty"))
     (when (cl-find name machines :key #'ssh-machine-name :test #'string=)
       (user-error "A machine with name '%s' already exists" name))
 
-    (let ((host (read-string "Host: ")))
-      ;; Check for duplicate host
+    ;; Read and validate host
+    (let ((host (string-trim (read-string "Host: "))))
+      (when (string-empty-p host)
+        (user-error "Host cannot be empty"))
       (when (cl-find host machines :key #'ssh-machine-host :test #'string=)
         (user-error "A machine with host '%s' already exists" host))
 
-      (let* ((user (read-string "User (optional): "))
-             (desc (read-string "Description: "))
+      ;; Optional fields
+      (let* ((user-input (string-trim (read-string "User (optional): ")))
+             (user (unless (string-empty-p user-input) user-input))
+             (desc (string-trim (read-string "Description: ")))
              (key (ssh-select-or-create-key))
              (machine (make-ssh-machine
                        :name name
                        :host host
-                       :user (unless (string-empty-p user) user)
+                       :user user        ;; normalized: nil if empty
                        :description desc
-                       :key key)))
+                       :key key)))       ;; nil if not selected
         (push machine (multisession-value ssh-machines-list))
-        (message "Machine %s created" name)))))
-
-;; (defun add-ssh-machine ()
-;;   "Add a new SSH machine."
-;;   (interactive)
-
-;;   (let* ((name (read-string "Name: "))
-;;          (host (read-string "Host: "))
-;;          (user (read-string "User (optional): "))
-;;          (desc (read-string "Description: "))
-;;          (key (ssh-select-or-create-key))
-
-;;          (machine
-;;           (make-ssh-machine
-;;            :name name
-;;            :host host
-;;            :user (unless (string-empty-p user) user)
-;;            :description desc
-;;            :key key)))
-
-;;     (push machine (multisession-value ssh-machines-list))
-
-;;     (message "Machine %s created" name)))
+        (message "Added %s to SSH machines list" name)))))
 
 (defun remove-ssh-machine ()
   (interactive)
@@ -100,7 +89,7 @@ Possible values are `scp' or `rsync'."
            machines))
     (message "Removed %s from SSH machines list" selected)))
 
-(defun ssh-machine-address (machine)
+(defun ssh-machine-full-address (machine)
   "Return full SSH address for MACHINE."
   (let ((user (ssh-machine-user machine))
         (host (ssh-machine-host machine)))
@@ -109,14 +98,14 @@ Possible values are `scp' or `rsync'."
       host)))
 
 (defun ssh-connect-machine (machine)
-  (let* ((address (ssh-machine-address machine))
+  (let* ((address (ssh-machine-full-address machine))
          (key (ssh-machine-key machine))
          (key-option
           (when key
             (format " -i %s"
                     (shell-quote-argument
                      (expand-file-name key ssh-keys-directory))))))
-    (ansi-term (concat "ssh" key-option " " address))))
+    (ansi-term (concat "ssh" (or key-option "") " " address))))
 
 (defun ssh-connect ()
   "Connect to a machine via SSH."
@@ -161,7 +150,7 @@ Possible values are `scp' or `rsync'."
 \\{ssh-machines-mode-map}"
   :keymap ssh-machines-mode-map
   (setq tabulated-list-format [("Name" 15 t)
-			       ("Host" 25 t)
+			       ("Host" 30 t)
 			       ("Description" 25 t)
 			       ("Key" 15 t)])
   (setq tabulated-list-padding 2)
@@ -176,7 +165,7 @@ Possible values are `scp' or `rsync'."
         (ssh-machine-name machine)
         (vector
          (ssh-machine-name machine)
-	 (ssh-machine-address machine)
+	 (ssh-machine-full-address machine)
          ;;(ssh-machine-host machine)
          ;;(or (ssh-machine-user machine) "")
          (or (ssh-machine-description machine) "")
@@ -382,7 +371,7 @@ Prompts for remote path. Opens a terminal for secure password entry."
     (when machine
       (let* ((remote-path (read-string "Remote destination path: "))
              (local-file (expand-file-name file-path))
-             (address (ssh-machine-address machine))
+             (address (ssh-machine-full-address machine))
              (key (ssh-machine-key machine))
              (key-option (if key
                              (format "-i %s" (shell-quote-argument
@@ -498,7 +487,7 @@ Prompts for both key and machine, uses `ssh-machine` structs."
       (async-shell-command
        (format "ssh-copy-id -i %s %s"
                (shell-quote-argument pub-key-path)
-               (ssh-machine-address machine))
+               (ssh-machine-full-address machine))
        "*SSH Copy ID*")
       (message "Started copying key %s to %s..." key-file selected-name))))
 
@@ -541,7 +530,8 @@ Prompts for both key and machine, uses `ssh-machine` structs."
                    :description desc
                    :key key)))))
           (multisession-value ssh-machines-list))))
-    (setf (multisession-value ssh-machines-list) new-list)))
+    (setf (multisession-value ssh-machines-list) new-list))
+  (message "Migrated %d entries" ))
 
 (provide 'init-ssh)
 
