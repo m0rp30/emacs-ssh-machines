@@ -111,15 +111,25 @@ If ADDRESS is \"user@host@weird\", USER is \"user\" and HOST is \"host@weird\"."
     (cons nil address)))
 
 (defun ssh-connect-machine (machine)
-  "Connect to a machine"
+  "Helper function that connects to the given machine.
+The buffer is killed when the process state is exit."
   (let* ((address (ssh-machine-full-address machine))
          (key (ssh-machine-key machine))
          (key-option
           (when key
             (format " -i %s"
                     (shell-quote-argument
-                     (expand-file-name key ssh-keys-directory))))))
-    (ansi-term (concat "ssh" (or key-option "") " " address) (concat "ssh-term-" (ssh-machine-name machine)))))
+                     (expand-file-name key ssh-keys-directory)))))
+	 (term-buf (ansi-term (concat "ssh" (or key-option "") " " address)
+                              (concat "ssh-term-" (ssh-machine-name machine)))))
+    (when-let ((proc (get-buffer-process term-buf)))
+      (set-process-sentinel
+       proc
+       (lambda (process _event)
+         (when (memq (process-status process) '(exit signal))
+           (when-let ((buf (process-buffer process)))
+             (when (buffer-live-p buf)
+               (kill-buffer buf)))))))))
 
 (defun ssh-connect ()
   "Connect to a machine via SSH."
@@ -138,7 +148,7 @@ If ADDRESS is \"user@host@weird\", USER is \"user\" and HOST is \"host@weird\"."
       (ssh-connect-machine machine))))
 
 (defun ssh-machines-connect-at-point ()
-  "Connect to the SSH machine at point."
+  "Connect to machine at the point via SSH."
   (interactive)
   (let ((name (tabulated-list-get-id)))
     (if (not name)
